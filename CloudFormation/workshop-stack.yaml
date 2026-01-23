@@ -108,6 +108,7 @@ Resources:
                 Action:
                   - sagemaker:InvokeEndpoint
                   - sagemaker:ListInferenceComponents
+                  - sagemaker:DescribeEndpoint
                 Resource: "*"
               - Effect: Allow
                 Action:
@@ -265,21 +266,59 @@ Resources:
           import os
           import base64
           from io import BytesIO
+          from botocore.exceptions import ClientError
 
           sm_client = boto3.client('sagemaker')
           runtime = boto3.client('runtime.sagemaker')
           s3_client = boto3.client('s3')
 
           def lambda_handler(event, context):
+
+              http_method = event.get('requestContext', {}).get('http', {}).get('method')
+              
+              headers = {
+                  'Access-Control-Allow-Origin': '*',
+                  'Access-Control-Allow-Headers': 'Content-Type',
+                  'Access-Control-Allow-Methods': 'OPTIONS,POST,GET'
+              }
+
+              if http_method == 'GET':
+                  try:
+                      params = event.get('queryStringParameters', {})
+                      endpoint_name = params.get('endpoint_name')
+                      
+                      if not endpoint_name:
+                          return {'statusCode': 400, 'headers': headers, 'body': json.dumps({'message': 'Missing endpoint_name'})}
+
+                      response = sm_client.describe_endpoint(EndpointName=endpoint_name)
+                      status = response['EndpointStatus']
+                      
+                      if status == 'InService':
+                          return {'statusCode': 200, 'headers': headers, 'body': json.dumps({'message': 'Endpoint exist', 'status': status})}
+                      else:
+                          return {'statusCode': 409, 'headers': headers, 'body': json.dumps({'message': f'Endpoint is {status}', 'status': status})}
+                          
+                  except ClientError as e:
+                      error_code = e.response['Error']['Code']
+                      if error_code == 'ValidationException':
+                          return {'statusCode': 404, 'headers': headers, 'body': json.dumps({'message': 'Endpoint not found'})}
+                      else:
+                          print(f"AWS ClientError: {str(e)}")
+                          return {'statusCode': 500, 'headers': headers, 'body': json.dumps({'message': f"AWS Error: {error_code}"})}
+                          
+                  except Exception as e:
+                      print(f"Unknown Error: {str(e)}")
+                      return {'statusCode': 500, 'headers': headers, 'body': json.dumps({'message': str(e)})}
+
               try:
                   body = json.loads(event.get('body', '{}'))
+                  
                   prompt = body.get('prompt', 'a beautiful landscape')
                   connection_id = body.get('connectionId')
-                  
                   endpoint_name = body.get('endpoint_name')
                   
                   if not endpoint_name:
-                      return {'statusCode': 400, 'body': 'Error: Missing endpoint_name'}
+                      return {'statusCode': 400, 'headers': headers, 'body': 'Error: Missing endpoint_name'}
 
                   bucket_name = os.environ['BUCKET_NAME']
 
@@ -324,18 +363,14 @@ Resources:
                       )
                       return {
                           'statusCode': 200,
-                          'headers': {
-                              'Access-Control-Allow-Origin': '*',
-                              'Access-Control-Allow-Headers': 'Content-Type',
-                              'Access-Control-Allow-Methods': 'OPTIONS,POST'
-                          }, 
+                          'headers': headers, 
                           'body': json.dumps({'message': 'Success', 's3_key': file_name})
                       }
-                  return {'statusCode': 500, 'body': 'No image generated'}
+                  return {'statusCode': 500, 'headers': headers, 'body': 'No image generated'}
 
               except Exception as e:
                   print(f"Error: {str(e)}")
-                  return {'statusCode': 500, 'body': str(e)}
+                  return {'statusCode': 500, 'headers': headers, 'body': str(e)}
 
   NotifyFunction:
     Type: AWS::Lambda::Function
@@ -458,6 +493,7 @@ Resources:
           - "*"
         AllowMethods:
           - POST
+          - GET
           - OPTIONS
         AllowHeaders:
           - Content-Type
@@ -469,6 +505,7 @@ Resources:
       StageName: $default
       AutoDeploy: true
 
+  # Routes
   GenerateRoute:
     Type: AWS::ApiGatewayV2::Route
     Properties:
@@ -476,13 +513,12 @@ Resources:
       RouteKey: "POST /generate"
       Target: !Join ["/", ["integrations", !Ref GenerateIntegration]]
 
-  GenerateIntegration:
-    Type: AWS::ApiGatewayV2::Integration
+  GenerateGetRoute:
+    Type: AWS::ApiGatewayV2::Route
     Properties:
       ApiId: !Ref HttpApi
-      IntegrationType: AWS_PROXY
-      IntegrationUri: !GetAtt GenerateFunction.Arn
-      PayloadFormatVersion: "2.0"
+      RouteKey: "GET /generate"
+      Target: !Join ["/", ["integrations", !Ref GenerateIntegration]]
 
   ShareRoute:
     Type: AWS::ApiGatewayV2::Route
@@ -490,6 +526,15 @@ Resources:
       ApiId: !Ref HttpApi
       RouteKey: "POST /share"
       Target: !Join ["/", ["integrations", !Ref ShareIntegration]]
+
+  # Integrations
+  GenerateIntegration:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref HttpApi
+      IntegrationType: AWS_PROXY
+      IntegrationUri: !GetAtt GenerateFunction.Arn
+      PayloadFormatVersion: "2.0"
 
   ShareIntegration:
     Type: AWS::ApiGatewayV2::Integration
